@@ -484,7 +484,6 @@ from collections import defaultdict
 # ─── Dependency Check ──────────────────────────────────────────
 try:
     from scapy.all import rdpcap, Raw
-    from scapy.layers.usb import USBpcap, USB
 except ImportError:
     print("[!] Scapy not found. Installing...")
     os.system("pip install scapy --break-system-packages -q")
@@ -501,8 +500,7 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════════
-#  PART B — HID KEYMAPS
-#  Maps raw HID hex keycodes → readable characters
+#  HID KEYMAPS
 # ══════════════════════════════════════════════════════════════
 
 KEYMAP = {
@@ -565,53 +563,75 @@ def banner():
 """)
 
 
+def extract_usb_data(pcap_file):
+    """Extract raw USB HID data from pcap using multiple methods."""
+    print(f"[*] Loading PCAP: {pcap_file}")
+    packets = rdpcap(pcap_file)
+    print(f"[*] Total packets: {len(packets)}")
+
+    data_list = []
+    USB_HEADER_LEN = 64  # Linux USB memory-mapped header is 64 bytes
+
+    for pkt in packets:
+        raw = None
+
+        # Method 1: Get from Raw layer
+        if pkt.haslayer(Raw):
+            raw = bytes(pkt[Raw])
+        # Method 2: Get from load attribute
+        elif hasattr(pkt, 'load'):
+            raw = bytes(pkt.load)
+
+        if raw is None:
+            continue
+
+        # Linux USB packets = 64-byte header + HID payload
+        # Must strip header to get real HID data
+        if len(raw) > USB_HEADER_LEN:
+            hid = raw[USB_HEADER_LEN:]
+        else:
+            hid = raw  # already stripped format
+
+        if len(hid) >= 3:
+            data_list.append(hid)
+
+    print(f"[*] Extracted {len(data_list)} HID packets\n")
+    return data_list
+
+
 def signed_byte(val):
     """Convert unsigned byte to signed (-128 to 127)."""
     return val - 256 if val > 127 else val
 
 
 def save_text(content, filename="keyboard_output.txt"):
+    """Save text output to file."""
     with open(filename, 'w') as f:
         f.write(content)
     print(f"[+] Text saved to: {filename}")
 
 
 # ══════════════════════════════════════════════════════════════
-#  PART C — DATA EXTRACTION
-#  Loads all USB HID data packets from the PCAP file
-# ══════════════════════════════════════════════════════════════
-
-def extract_usb_data(pcap_file):
-    print(f"[*] Loading PCAP: {pcap_file}")
-    packets = rdpcap(pcap_file)
-    print(f"[*] Total packets: {len(packets)}")
-
-    data_list = []
-    for pkt in packets:
-        raw = None
-        if pkt.haslayer(Raw):
-            raw = bytes(pkt[Raw])
-        elif hasattr(pkt, 'load'):
-            raw = bytes(pkt.load)
-        if raw and len(raw) >= 4:
-            data_list.append(raw)
-
-    print(f"[*] Extracted {len(data_list)} data packets\n")
-    return data_list
-
-
-# ══════════════════════════════════════════════════════════════
-#  PART D — KEYBOARD DECODER
-#  Reconstructs typed text from USB keyboard HID packets
+#  MODE 1: KEYBOARD DECODER
 # ══════════════════════════════════════════════════════════════
 
 def decode_keyboard(data_list):
+    """
+    Decode USB HID keyboard packets.
+    HID Report Format (8 bytes):
+        Byte 0: Modifier (Shift/Ctrl/Alt flags)
+        Byte 1: Reserved
+        Byte 2: Keycode 1
+        Byte 3: Keycode 2 (multi-key)
+        ...
+    """
     print("=" * 60)
     print("  ⌨️  KEYBOARD DECODER")
     print("=" * 60)
 
-    result    = []
-    caps_lock = False
+    result     = []
+    raw_log    = []
+    caps_lock  = False
 
     for raw in data_list:
         if len(raw) < 3:
@@ -623,19 +643,25 @@ def decode_keyboard(data_list):
         if keycode == 0:
             continue
 
+        raw_log.append(f"MOD={hex(modifier)} KEY={hex(keycode)}")
+
+        # Shift detection
         shift = (modifier & 0x02) or (modifier & 0x20)
 
+        # CapsLock toggle
         if keycode == 0x39:
             caps_lock = not caps_lock
             result.append('[CAPSLOCK]')
             continue
 
+        # Ctrl combinations
         if modifier & 0x01 or modifier & 0x10:
             char = KEYMAP.get(keycode, '')
             if char:
                 result.append(f'[CTRL+{char.upper()}]')
             continue
 
+        # Get character
         if shift:
             char = SHIFT_KEYMAP.get(keycode, KEYMAP.get(keycode, f'[{hex(keycode)}]'))
         elif caps_lock:
@@ -643,16 +669,20 @@ def decode_keyboard(data_list):
         else:
             char = KEYMAP.get(keycode, f'[{hex(keycode)}]')
 
-        if char == '[BACKSPACE]' and result:
-            result.pop()
+        # Handle backspace
+        if char == '[BACKSPACE]':
+            if result:
+                result.pop()
         else:
             result.append(char)
 
+    # Build output
     full_text = ''.join(result)
 
     print("\n[+] ── RAW KEYSTROKES (with special keys) ──")
-    print(full_text)
+    print(''.join(result))
 
+    # Clean version (remove special key labels)
     clean = ''.join(
         c for c in result
         if not (c.startswith('[') and c.endswith(']'))
@@ -660,6 +690,7 @@ def decode_keyboard(data_list):
     print("\n[+] ── CLEAN TEXT OUTPUT ──")
     print(clean)
 
+    # Try to find flag patterns
     import re
     flags = re.findall(r'[A-Za-z0-9_]+\{[^\}]+\}', full_text)
     if flags:
@@ -672,18 +703,26 @@ def decode_keyboard(data_list):
 
 
 # ══════════════════════════════════════════════════════════════
-#  PART E — MOUSE TRACKER
-#  Plots USB mouse movement as PNG images
+#  MODE 2: MOUSE TRACKER
 # ══════════════════════════════════════════════════════════════
 
 def decode_mouse(data_list):
+    """
+    Decode USB HID mouse packets and plot movement.
+    HID Report Format (4 bytes):
+        Byte 0: Buttons (bit0=Left, bit1=Right, bit2=Middle)
+        Byte 1: X movement (signed)
+        Byte 2: Y movement (signed)
+        Byte 3: Scroll wheel (signed)
+    """
     print("=" * 60)
     print("  🖱️  MOUSE TRACKER")
     print("=" * 60)
 
-    x, y         = 2000, 2000
-    all_points   = []
-    click_points = []
+    x, y   = 2000, 2000   # start at center of canvas
+    all_points   = []      # every position
+    click_points = []      # only when button pressed
+    left_drag    = []      # left button held
 
     for raw in data_list:
         if len(raw) < 3:
@@ -698,48 +737,67 @@ def decode_mouse(data_list):
 
         all_points.append((x, y))
 
-        if buttons & 0x01:
+        left_click  = buttons & 0x01
+        right_click = buttons & 0x02
+
+        if left_click:
             click_points.append((x, y))
+            left_drag.append((x, y))
+        else:
+            left_drag = []  # reset drag on release
 
     print(f"[+] Total movement points : {len(all_points)}")
     print(f"[+] Left-click points     : {len(click_points)}")
 
-    # Plot 1: All movement
+    if not PIL_AVAILABLE:
+        print("[!] Pillow not available, cannot generate image.")
+        return
+
+    # ── Plot 1: All movement ──
     img_all = Image.new('RGB', (4000, 4000), 'white')
     draw    = ImageDraw.Draw(img_all)
     if len(all_points) > 1:
         draw.line(all_points, fill='lightgray', width=1)
     img_all.save("mouse_all_movement.png")
-    print("[+] Saved: mouse_all_movement.png")
+    print("[+] All movement saved  : mouse_all_movement.png")
 
-    # Plot 2: Click dots
+    # ── Plot 2: Click-only points ──
     img_click = Image.new('RGB', (4000, 4000), 'white')
     draw2     = ImageDraw.Draw(img_click)
     for pt in click_points:
         draw2.ellipse([pt[0]-3, pt[1]-3, pt[0]+3, pt[1]+3], fill='black')
     img_click.save("mouse_clicks.png")
-    print("[+] Saved: mouse_clicks.png")
+    print("[+] Click path saved    : mouse_clicks.png")
 
-    # Plot 3: Click path line
+    # ── Plot 3: Click path as connected line ──
     img_path = Image.new('RGB', (4000, 4000), 'white')
     draw3    = ImageDraw.Draw(img_path)
     if len(click_points) > 1:
         draw3.line(click_points, fill='black', width=2)
     img_path.save("mouse_click_path.png")
-    print("[+] Saved: mouse_click_path.png")
+    print("[+] Click line saved    : mouse_click_path.png")
+
+    print("\n[*] Tip: Open mouse_clicks.png or mouse_click_path.png")
+    print("    to see if a flag/pattern was drawn!")
 
 
 # ══════════════════════════════════════════════════════════════
-#  PART F — PRINTER DATA EXTRACTOR
-#  Extracts and identifies printer job data
+#  MODE 3: PRINTER DATA EXTRACTOR
 # ══════════════════════════════════════════════════════════════
 
 def decode_printer(data_list):
+    """
+    Extract and reconstruct printer data from USB bulk transfers.
+    Output is usually PCL or PostScript format.
+    """
     print("=" * 60)
     print("  🖨️  PRINTER DATA EXTRACTOR")
     print("=" * 60)
 
-    combined = b''.join(data_list)
+    combined = b''
+    for raw in data_list:
+        if len(raw) > 0:
+            combined += raw
 
     if not combined:
         print("[!] No printer data found.")
@@ -747,8 +805,9 @@ def decode_printer(data_list):
 
     print(f"[+] Total printer data: {len(combined)} bytes")
 
+    # Detect format
     if combined[:2] in (b'\x1b\x45', b'\x1b%'):
-        print("[+] Detected: PCL")
+        print("[+] Detected: PCL (HP Printer Language)")
         ext = '.pcl'
     elif combined[:2] == b'%!':
         print("[+] Detected: PostScript")
@@ -757,7 +816,7 @@ def decode_printer(data_list):
         print("[+] Detected: PDF")
         ext = '.pdf'
     else:
-        print("[+] Format: Unknown — saving as .bin")
+        print("[+] Format: Unknown binary — saving as .bin")
         ext = '.bin'
 
     outfile = f"printer_output{ext}"
@@ -765,13 +824,15 @@ def decode_printer(data_list):
         f.write(combined)
     print(f"[+] Saved to: {outfile}")
 
+    # Try to extract readable strings
     import re
     strings = re.findall(b'[ -~]{6,}', combined)
     if strings:
-        print("\n[+] ── READABLE STRINGS ──")
+        print("\n[+] ── READABLE STRINGS IN PRINTER DATA ──")
         for s in strings[:40]:
             print(f"  {s.decode(errors='ignore')}")
 
+    # Look for flags
     full_text = combined.decode(errors='ignore')
     flags = re.findall(r'[A-Za-z0-9_]+\{[^\}]+\}', full_text)
     if flags:
@@ -781,28 +842,34 @@ def decode_printer(data_list):
 
 
 # ══════════════════════════════════════════════════════════════
-#  PART G — MASS STORAGE FILE CARVER
-#  Finds and extracts files hidden in USB drive transfers
+#  MODE 4: MASS STORAGE EXTRACTOR
 # ══════════════════════════════════════════════════════════════
 
 def decode_storage(data_list):
+    """
+    Extract files from USB Mass Storage bulk transfer data.
+    Looks for known file signatures (magic bytes).
+    """
     print("=" * 60)
     print("  💾  MASS STORAGE EXTRACTOR")
     print("=" * 60)
 
+    # Known file magic bytes
     MAGIC = {
-        b'\x89PNG':          ('png',  'PNG Image'),
-        b'\xff\xd8\xff':     ('jpg',  'JPEG Image'),
-        b'PK\x03\x04':       ('zip',  'ZIP Archive'),
-        b'%PDF':             ('pdf',  'PDF Document'),
-        b'GIF8':             ('gif',  'GIF Image'),
-        b'\x1f\x8b':         ('gz',   'GZip Archive'),
-        b'BZh':              ('bz2',  'BZip2 Archive'),
-        b'\x7fELF':          ('elf',  'ELF Binary'),
-        b'MZ':               ('exe',  'Windows Executable'),
-        b'RIFF':             ('wav',  'WAV Audio'),
-        b'ID3':              ('mp3',  'MP3 Audio'),
-        b'OggS':             ('ogg',  'OGG Audio'),
+        b'\x89PNG':    ('png',  'PNG Image'),
+        b'\xff\xd8\xff':('jpg', 'JPEG Image'),
+        b'PK\x03\x04': ('zip',  'ZIP Archive'),
+        b'%PDF':        ('pdf',  'PDF Document'),
+        b'GIF8':        ('gif',  'GIF Image'),
+        b'\x1f\x8b':   ('gz',   'GZip Archive'),
+        b'BZh':         ('bz2',  'BZip2 Archive'),
+        b'\x7fELF':    ('elf',  'ELF Binary'),
+        b'MZ':          ('exe',  'Windows Executable'),
+        b'RIFF':        ('wav',  'WAV Audio'),
+        b'ID3':         ('mp3',  'MP3 Audio'),
+        b'\xff\xfb':   ('mp3',  'MP3 Audio'),
+        b'OggS':        ('ogg',  'OGG Audio'),
+        b'\x00\x00\x00\x20ftyp': ('mp4', 'MP4 Video'),
     }
 
     combined = b''.join(data_list)
@@ -822,79 +889,112 @@ def decode_storage(data_list):
 
     if not found:
         print("[!] No known file signatures found.")
+        print("[*] Saving raw combined data as storage_raw.bin")
         with open('storage_raw.bin', 'wb') as f:
             f.write(combined)
-        print("[*] Raw data saved to storage_raw.bin")
         return
 
     print(f"\n[+] Found {len(found)} potential files:")
     for i, (pos, ext, desc) in enumerate(found):
         print(f"  [{i+1}] Offset {pos:#010x} → {desc} (.{ext})")
 
+    # Extract each file
     for i, (pos, ext, desc) in enumerate(found):
-        end   = found[i+1][0] if i+1 < len(found) else len(combined)
+        # Determine end (next file start or end of data)
+        if i + 1 < len(found):
+            end = found[i + 1][0]
+        else:
+            end = len(combined)
+
         chunk = combined[pos:end]
         fname = f"extracted_{i+1}.{ext}"
         with open(fname, 'wb') as f:
             f.write(chunk)
         print(f"[+] Saved: {fname} ({len(chunk)} bytes)")
 
+    # Also look for text/flag
     import re
-    text  = combined.decode(errors='ignore')
+    text = combined.decode(errors='ignore')
     flags = re.findall(r'[A-Za-z0-9_]+\{[^\}]+\}', text)
     if flags:
-        print("\n[🚩] ── FLAGS IN RAW DATA ──")
+        print("\n[🚩] ── FLAGS FOUND IN RAW DATA ──")
         for flag in flags:
             print(f"  → {flag}")
 
 
 # ══════════════════════════════════════════════════════════════
-#  PART H — AUTO DETECTION
-#  Scores packets to guess device type automatically
+#  MODE 5: AUTO DETECT
 # ══════════════════════════════════════════════════════════════
 
 def auto_detect(data_list, pcap_file):
+    """
+    Automatically detect USB device type and run appropriate decoder.
+    """
     print("=" * 60)
     print("  🔍  AUTO DETECTION MODE")
     print("=" * 60)
 
+    if not data_list:
+        print("[!] No USB data found in PCAP.")
+        return
+
+    # Analyze first few packets to guess type
     keyboard_score = 0
     mouse_score    = 0
     bulk_score     = 0
 
     for raw in data_list[:100]:
-        if len(raw) == 8:
-            keyboard_score += 1
-        elif len(raw) == 4:
-            mouse_score += 1
-        elif len(raw) > 16:
+        length = len(raw)
+
+        # Keyboard: usually 8 bytes, byte[0] is modifier, byte[2] is keycode
+        if length == 8:
+            mod = raw[0]
+            key = raw[2] if length > 2 else 0
+            if mod in (0x00, 0x02, 0x20, 0x22) and key < 0x73:
+                keyboard_score += 1
+
+        # Mouse: usually 4 bytes
+        elif length == 4:
+            btn = raw[0]
+            if btn in (0x00, 0x01, 0x02, 0x03):
+                mouse_score += 1
+
+        # Bulk transfer: larger packets
+        elif length > 16:
             bulk_score += 1
 
     print(f"  Keyboard score : {keyboard_score}")
     print(f"  Mouse score    : {mouse_score}")
     print(f"  Bulk score     : {bulk_score}")
 
-    scores   = {'keyboard': keyboard_score, 'mouse': mouse_score, 'bulk': bulk_score}
+    scores = {
+        'keyboard': keyboard_score,
+        'mouse':    mouse_score,
+        'bulk':     bulk_score,
+    }
     detected = max(scores, key=scores.get)
 
-    print(f"\n[+] Detected: {detected.upper()}\n")
+    print(f"\n[+] Detected device type: {detected.upper()}\n")
 
     if detected == 'keyboard':
         decode_keyboard(data_list)
     elif detected == 'mouse':
         decode_mouse(data_list)
     else:
+        # Try printer first, then storage
+        print("[*] Bulk transfer detected — trying printer, then storage...")
         decode_printer(data_list)
         decode_storage(data_list)
 
 
 # ══════════════════════════════════════════════════════════════
-#  HEX DUMP — Raw packet inspection
+#  MODE 6: HEX DUMP / RAW ANALYSIS
 # ══════════════════════════════════════════════════════════════
 
 def hex_dump(data_list, limit=30):
+    """Show hex dump of first N packets for manual analysis."""
     print("=" * 60)
-    print("  🔬  HEX DUMP")
+    print("  🔬  HEX DUMP (first packets)")
     print("=" * 60)
     for i, raw in enumerate(data_list[:limit]):
         hex_str = ' '.join(f'{b:02x}' for b in raw)
@@ -903,19 +1003,29 @@ def hex_dump(data_list, limit=30):
 
 
 # ══════════════════════════════════════════════════════════════
-#  PART I — MAIN ENTRY POINT
-#  Parses arguments and routes to the correct decoder
+#  MAIN
 # ══════════════════════════════════════════════════════════════
 
 def main():
     banner()
 
-    parser = argparse.ArgumentParser(description='USB PCAP CTF Solver')
+    parser = argparse.ArgumentParser(
+        description='USB PCAP CTF Solver',
+        formatter_class=argparse.RawTextHelpFormatter
+    )
     parser.add_argument('pcap', help='Path to .pcap file')
     parser.add_argument('--mode', default='auto',
-        choices=['auto', 'keyboard', 'mouse', 'printer', 'storage', 'hex'])
+        choices=['auto', 'keyboard', 'mouse', 'printer', 'storage', 'hex'],
+        help="""Solving mode:
+  auto     - Auto detect and solve (default)
+  keyboard - Decode USB keyboard keystrokes
+  mouse    - Plot USB mouse movements
+  printer  - Extract USB printer data
+  storage  - Carve files from USB mass storage
+  hex      - Raw hex dump for manual inspection
+""")
     parser.add_argument('--all', action='store_true',
-        help='Run ALL decoders')
+        help='Run ALL decoders on the file')
 
     args = parser.parse_args()
 
@@ -923,34 +1033,49 @@ def main():
         print(f"[!] File not found: {args.pcap}")
         sys.exit(1)
 
+    # Extract raw USB data
     data_list = extract_usb_data(args.pcap)
 
     if not data_list:
-        print("[!] No USB data found.")
+        print("[!] Could not extract USB data from this PCAP.")
+        print("[*] Make sure this is a USB capture (not network).")
         sys.exit(1)
 
+    # Show hex dump of first 10 packets always
     hex_dump(data_list, limit=10)
     print()
 
+    # Run selected mode
     if args.all:
+        print("\n[*] Running ALL decoders...\n")
         decode_keyboard(data_list)
+        print()
         decode_mouse(data_list)
+        print()
         decode_printer(data_list)
+        print()
         decode_storage(data_list)
     else:
         mode = args.mode
-        if mode == 'auto':       auto_detect(data_list, args.pcap)
-        elif mode == 'keyboard': decode_keyboard(data_list)
-        elif mode == 'mouse':    decode_mouse(data_list)
-        elif mode == 'printer':  decode_printer(data_list)
-        elif mode == 'storage':  decode_storage(data_list)
-        elif mode == 'hex':      hex_dump(data_list, limit=100)
+        if mode == 'auto':
+            auto_detect(data_list, args.pcap)
+        elif mode == 'keyboard':
+            decode_keyboard(data_list)
+        elif mode == 'mouse':
+            decode_mouse(data_list)
+        elif mode == 'printer':
+            decode_printer(data_list)
+        elif mode == 'storage':
+            decode_storage(data_list)
+        elif mode == 'hex':
+            hex_dump(data_list, limit=100)
 
     print("\n[✓] Done!")
 
 
 if __name__ == '__main__':
     main()
+
 ```
 
 ---
